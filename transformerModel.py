@@ -7,7 +7,7 @@ import numpy as np
 from tqdm import tqdm
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=30):
+    def __init__(self, d_model, max_len=200):
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -21,7 +21,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 class TrajectoryTransformer(nn.Module):
-    def __init__(self, input_dim=31, hidden_dim=128, num_layers=2, nhead=4, max_seq_len=30):
+    def __init__(self, input_dim=31, hidden_dim=128, num_layers=2, nhead=4, max_seq_len=200):
         super(TrajectoryTransformer, self).__init__()
         
         # 输入处理
@@ -43,7 +43,7 @@ class TrajectoryTransformer(nn.Module):
         # 用于自回归生成的起始token
         self.start_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         
-    def forward(self, joint_angles, joint_positions, target_position, max_len=30):
+    def forward(self, joint_angles, joint_positions, target_position, max_len=200):
         batch_size = joint_angles.size(0)
         
         # 合并输入特征
@@ -87,14 +87,14 @@ class TrajectoryTransformer(nn.Module):
 
 def train_transformer(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.1)
     criterion = nn.MSELoss()
     
     # 创建数据加载器
     from torch.utils.data import TensorDataset, DataLoader
     
     # 填充轨迹到相同长度，但最大不超过30
-    max_traj_len = min(30, max([traj.size(0) for traj in dataset['trajectories']]))
+    max_traj_len = min(200, max([traj.size(0) for traj in dataset['trajectories']]))
     padded_trajectories = []
     
     for traj in dataset['trajectories']:
@@ -137,7 +137,7 @@ def train_transformer(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
             target_positions = target_positions.to(device)
             target_trajectories = target_trajectories.to(device)
             # 前向传播
-            pred_trajectories = model(joint_angles, joint_positions, target_positions, max_len=30)
+            pred_trajectories = model(joint_angles, joint_positions, target_positions, max_len=200)
             
             # 计算损失（只考虑非填充部分）
             loss = criterion(pred_trajectories, target_trajectories)
@@ -157,7 +157,7 @@ def train_transformer(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
     torch.save(model.state_dict(), r'C:\DiskD\trae_doc\robot_gym\transformer_model.pth')
     return model
 
-def collect_data_with_transformer(env, transformer_model, num_trajectories=1000, max_steps=30):
+def collect_data_with_transformer(env, transformer_model, num_trajectories=1000, max_steps=200):
     dataset = {
         'observations': [],
         'actions': [],
