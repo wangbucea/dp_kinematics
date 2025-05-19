@@ -89,7 +89,7 @@ def main():
         print("Transformer模型未找到，开始训练...")
         # 步骤1: 使用传统方法收集初始数据
         print("收集初始数据...")
-        dataset = collect_data(env, num_trajectories=100)
+        dataset = collect_data(env, num_trajectories=100, max_steps=200)
         print("初始数据收集完成: ", len(dataset['trajectories']), "条轨迹")
         # 步骤2: 训练Transformer模型
         state_dim = 7 + 7*3 + 3  # 关节角度 + 关节位置 + 目标位置
@@ -198,8 +198,11 @@ def main():
             )
             
             # 如果是10的倍数的episode，启用特殊渲染
-            render_episode = (episode + 1) % 10 == 0
-            
+            if (episode + 1) % 10 == 0 and episode > 950:
+                # 启用特殊渲染
+                render_episode = True
+            else:
+                render_episode = False
             # 清除之前的轨迹标记 - 修改：使用更安全的方式清理标记
             if hasattr(env, 'trajectory_markers') and env.trajectory_markers:
                 # 使用集合去重，避免重复删除
