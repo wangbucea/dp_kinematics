@@ -433,6 +433,11 @@ def train_rl_with_transformer(env, transformer_path, state_dim, action_dim, hidd
                 
                 # 更新上一个位置
                 env.last_end_effector_pos = current_end_effector_pos
+                
+                # 如果渲染步数达到1000，提前结束渲染
+                if episode_steps >= 1000:
+                    print("渲染步数达到1000步，提前结束渲染...")
+                    break
             
             # 存储经验
             replay_buffer.add(state, action, reward, next_state, done)
