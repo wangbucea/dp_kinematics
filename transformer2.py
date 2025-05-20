@@ -130,13 +130,28 @@ class TrajectoryTransformer2(nn.Module):
             
             return trajectory
 
-def train_transformer2(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
+def train_transformer2(model, dataset, num_epochs=100, batch_size=64, lr=1e-4, test_ratio=0.1, save_dir='model_results'):
+    """
+    训练Transformer模型，并将数据分为训练集和测试集
+    
+    Args:
+        model: 要训练的模型
+        dataset: 数据集
+        num_epochs: 训练轮数
+        batch_size: 批次大小
+        lr: 学习率
+        test_ratio: 测试集比例
+        save_dir: 保存结果的目录
+    """
+    # 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
     criterion = nn.MSELoss()
     
     # 创建数据加载器
-    from torch.utils.data import TensorDataset, DataLoader
+    from torch.utils.data import TensorDataset, DataLoader, random_split
     
     # 获取模型的最大序列长度
     max_seq_len = model.max_seq_len
@@ -166,16 +181,30 @@ def train_transformer2(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
         processed_trajectories
     )
     
-    dataloader = DataLoader(tensor_dataset, batch_size=batch_size, shuffle=True)
+    # 划分训练集和测试集
+    dataset_size = len(tensor_dataset)
+    test_size = int(dataset_size * test_ratio)
+    train_size = dataset_size - test_size
+    train_dataset, test_dataset = random_split(tensor_dataset, [train_size, test_size])
+    
+    print(f"数据集总大小: {dataset_size}, 训练集: {train_size}, 测试集: {test_size}")
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    # 用于记录训练和测试损失
+    train_losses = []
+    test_losses = []
+    
     # 训练循环
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
         
-        for joint_angles, joint_positions, target_positions, target_trajectories in tqdm(dataloader):
+        for joint_angles, joint_positions, target_positions, target_trajectories in tqdm(train_dataloader):
             joint_angles = joint_angles.to(device)
             joint_positions = joint_positions.to(device)
             target_positions = target_positions.to(device)
@@ -201,16 +230,46 @@ def train_transformer2(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
         
         scheduler.step()
         
+        # 计算平均训练损失
+        avg_train_loss = total_loss / len(train_dataloader)
+        train_losses.append(avg_train_loss)
+        
+        # 在测试集上评估模型
+        model.eval()
+        test_loss = 0
+        with torch.no_grad():
+            for joint_angles, joint_positions, target_positions, target_trajectories in test_dataloader:
+                joint_angles = joint_angles.to(device)
+                joint_positions = joint_positions.to(device)
+                target_positions = target_positions.to(device)
+                target_trajectories = target_trajectories.to(device)
+                
+                # 前向传播
+                pred_trajectories = model(
+                    joint_angles, 
+                    joint_positions, 
+                    target_positions, 
+                    target_trajectory=None,  # 推理模式
+                )
+                
+                # 计算损失
+                loss = criterion(pred_trajectories, target_trajectories)
+                test_loss += loss.item()
+        
+        # 计算平均测试损失
+        avg_test_loss = test_loss / len(test_dataloader)
+        test_losses.append(avg_test_loss)
+        
         # 打印训练进度
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}")
+            print(f"Epoch [{epoch+1}/{num_epochs}], 训练损失: {avg_train_loss:.4f}, 测试损失: {avg_test_loss:.4f}")
             
             # 添加验证步骤
             model.eval()
             with torch.no_grad():
-                # 随机选择一个样本进行可视化
-                sample_idx = np.random.randint(0, len(tensor_dataset))
-                sample_joint_angles, sample_joint_positions, sample_target_positions, sample_target_trajectories = tensor_dataset[sample_idx]
+                # 随机选择一个测试样本进行可视化
+                sample_idx = np.random.randint(0, len(test_dataset))
+                sample_joint_angles, sample_joint_positions, sample_target_positions, sample_target_trajectories = test_dataset[sample_idx]
                 
                 # 将样本移动到设备上
                 sample_joint_angles = sample_joint_angles.unsqueeze(0).to(device)
@@ -235,9 +294,81 @@ def train_transformer2(model, dataset, num_epochs=100, batch_size=64, lr=1e-4):
                 print(f"验证MSE: {val_mse:.4f}")
     
     # 保存模型
-    torch.save(model.state_dict(), r'C:\DiskD\trae_doc\robot_gym\transformer_model.pth')
-    return model
-
+    model_path = os.path.join(save_dir, 'transformer_model.pth')
+    torch.save(model.state_dict(), model_path)
+    print(f"模型已保存至 {model_path}")
+    
+    # 绘制并保存损失曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, num_epochs+1), train_losses, label='训练损失')
+    plt.plot(range(1, num_epochs+1), test_losses, label='测试损失')
+    plt.xlabel('Epoch')
+    plt.ylabel('损失')
+    plt.title('训练和测试损失曲线')
+    plt.legend()
+    plt.grid(True)
+    
+    loss_curve_path = os.path.join(save_dir, 'loss_curve.png')
+    plt.savefig(loss_curve_path)
+    print(f"损失曲线已保存至 {loss_curve_path}")
+    
+    # 计算测试集上的最终MSE和到达目标点的准确率
+    model.eval()
+    total_mse = 0
+    total_success = 0
+    
+    with torch.no_grad():
+        for joint_angles, joint_positions, target_positions, target_trajectories in test_dataloader:
+            joint_angles = joint_angles.to(device)
+            joint_positions = joint_positions.to(device)
+            target_positions = target_positions.to(device)
+            target_trajectories = target_trajectories.to(device)
+            
+            # 前向传播
+            pred_trajectories = model(
+                joint_angles, 
+                joint_positions, 
+                target_positions, 
+                target_trajectory=None,  # 推理模式
+            )
+            
+            # 计算MSE
+            batch_mse = F.mse_loss(pred_trajectories, target_trajectories).item()
+            total_mse += batch_mse * joint_angles.size(0)
+            
+            # 计算到达目标点的准确率
+            # 这里我们假设轨迹的最后一个动作应该使末端执行器到达目标点
+            # 由于我们没有实际的环境来执行动作，这里只能通过比较最后一个动作与目标轨迹的最后一个动作的相似度来估计
+            last_pred_actions = pred_trajectories[:, -1, :]
+            last_target_actions = target_trajectories[:, -1, :]
+            
+            # 计算最后一个动作的误差
+            action_errors = torch.norm(last_pred_actions - last_target_actions, dim=1)
+            
+            # 如果误差小于阈值，则认为成功到达目标
+            success_count = (action_errors < 0.1).sum().item()
+            total_success += success_count
+    
+    # 计算平均MSE和准确率
+    avg_mse = total_mse / len(test_dataset)
+    accuracy = total_success / len(test_dataset) * 100
+    
+    print(f"测试集上的平均MSE: {avg_mse:.4f}")
+    print(f"估计的目标点到达准确率: {accuracy:.2f}%")
+    
+    # 保存测试结果
+    test_results = {
+        'avg_mse': avg_mse,
+        'accuracy': accuracy,
+        'train_losses': train_losses,
+        'test_losses': test_losses
+    }
+    
+    import pickle
+    with open(os.path.join(save_dir, 'test_results.pkl'), 'wb') as f:
+        pickle.dump(test_results, f)
+    
+    return model, test_results
 def collect_data_with_transformer(env, transformer_model, num_trajectories=1000, max_steps=200, use_rolling_prediction=True, decay_factor=0.9):
     """
     使用Transformer模型收集轨迹数据
