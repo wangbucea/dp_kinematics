@@ -6,9 +6,23 @@ import pybullet_data
 from tqdm import tqdm
 
 class RoboticArmEnv:
-    def __init__(self):
+    def __init__(self, use_gui=True):
         # 初始化PyBullet物理引擎
-        p.connect(p.GUI)#or p.DIRECT for non-graphical version
+        try:
+            # 尝试断开现有连接
+            p.disconnect()
+        except:
+            pass
+        
+        # 根据参数选择连接模式
+        if use_gui:
+            try:
+                p.connect(p.GUI)  # 图形界面模式
+            except:
+                print("无法使用GUI模式，切换到DIRECT模式")
+                p.connect(p.DIRECT)  # 如果GUI连接失败，使用DIRECT模式
+        else:
+            p.connect(p.DIRECT)  # 非图形界面模式
         p.setAdditionalSearchPath(pybullet_data.getDataPath()) #optionally
         p.setGravity(0,0,-9.81)
         _ = p.loadURDF("plane.urdf")
@@ -30,7 +44,7 @@ class RoboticArmEnv:
         # 记录上一步的末端执行器位置，用于判断是否停留
         self.last_end_effector_pos = None
         # 停留阈值 - 如果两步之间的移动距离小于此值，认为是停留
-        self.stay_threshold = 0.01
+        self.stay_threshold = 0.05
         # 停留奖励所需的最小时间步
         self.min_stay_steps = 5
         
@@ -82,7 +96,60 @@ class RoboticArmEnv:
             
         # 设置随机目标位置或使用指定目标
         if target_position is None:
-            self.target_position = np.random.uniform(low=[0.3, -0.3, 0.2], high=[0.5, 0.3, 0.4])
+            # 生成机械臂可达范围内的随机目标位置
+            # 确定机械臂基座位置
+            base_pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+            base_pos = np.array(base_pos)
+            
+            # 估计机械臂最大可达距离（根据机械臂链接长度总和估计）
+            # 对于RM-75机械臂，最大可达距离约为0.8米
+            max_reach = 0.8
+            
+            # 生成球形区域内的随机点
+            while True:
+                # 随机生成方向（单位球面上的点）
+                phi = np.random.uniform(0, np.pi/2)  # 限制在前方半球
+                theta = np.random.uniform(np.pi/4, np.pi/2)  # 限制水平范围
+                
+                direction = np.array([
+                    np.sin(phi) * np.cos(theta),
+                    np.sin(phi) * np.sin(theta),
+                    np.cos(phi)
+                ])
+                
+                # 随机生成距离（在最大可达范围内）
+                distance = np.random.uniform(0.5, 0.6)
+                
+                # 计算目标位置
+                target_pos = base_pos + direction * distance
+                
+                # 确保目标位置在工作空间内（高度大于0，避免目标位置在地面以下）
+                if target_pos[2] > 0.05:
+                    # 尝试使用IK检查该位置是否可达
+                    target_orn = p.getQuaternionFromEuler([0, 0, 0])
+                    ik_solution = p.calculateInverseKinematics(
+                        self.robot_id, 
+                        self.num_joints - 1, 
+                        target_pos,
+                        targetOrientation=target_orn,
+                        maxNumIterations=100,
+                        residualThreshold=0.01
+                    )
+                    
+                    # 验证IK解的质量
+                    test_angles = np.array(ik_solution[:self.num_joints])
+                    test_pos = self.get_end_effector_position(test_angles)
+                    error = np.linalg.norm(test_pos - target_pos)
+                    
+                    # 如果误差在可接受范围内，则认为该位置可达
+                    if error < 0.1:
+                        self.target_position = target_pos
+                        break
+                    
+                    # 如果尝试了多次仍找不到可达位置，则使用默认范围
+                    if np.random.random() < 0.1:  # 有10%的概率使用默认范围
+                        self.target_position = np.random.uniform(low=[0.3, -0.3, 0.2], high=[0.5, 0.3, 0.4])
+                        break
         else:
             self.target_position = target_position
         
@@ -95,7 +162,7 @@ class RoboticArmEnv:
         
     def step(self, action):
         # 将归一化动作转换为关节角度增量
-        action = np.clip(action, -1.0, 1.0)  # 限制每步移动幅度
+        action = np.clip(action, -0.05, 0.05)  # 限制每步移动幅度
         
         # 获取当前关节角度
         current_angles = np.array([p.getJointState(self.robot_id, joint_id)[0] for joint_id in range(self.num_joints)])
@@ -461,7 +528,7 @@ def collect_sequence_data(env, num_trajectories=1000, max_steps=100):
 
     for traj_idx in tqdm(range(num_trajectories)):
         # 重置环境，获取初始观测
-        obs = env.reset(random_init=True)
+        obs = env.reset(random_init=False)
 
         # 解析初始观测
         joint_angles = obs[:env.num_joints]
@@ -696,37 +763,24 @@ def collect_sequence_data(env, num_trajectories=1000, max_steps=100):
 
     return dataset
 
-
-def collect_sequence_data(env, num_trajectories=1000, max_steps=100):
-    """
-    收集机械臂轨迹数据，只保存成功到达目标的轨迹
-    
-    参数:
-        env: 机械臂环境实例
-        num_trajectories: 尝试生成的轨迹数量
-        max_steps: 每个轨迹的最大步数
-    
-    返回:
-        包含成功轨迹数据的字典
-    """
+def collect_sequence_data2(env, num_trajectories=1000, max_steps=100):
     dataset = {
-        'initial_joint_angles': [],
-        'initial_joint_positions': [],
+        'joint_angles': [],
+        'joint_positions': [],
         'target_positions': [],
-        'trajectories': [],
-        'sequence_joint_angles': [],
-        'sequence_joint_positions': []
+        'trajectories': []
     }
 
     # 记录成功到达目标的轨迹数量
     success_count = 0
-    attempt_count = 0
-    
-    # 进度条
-    pbar = tqdm(total=num_trajectories, desc="收集成功轨迹")
+    attempted_count = 0
 
-    while success_count < num_trajectories and attempt_count < num_trajectories * 3:
-        attempt_count += 1
+    # 使用tqdm创建进度条
+    pbar = tqdm(total=num_trajectories)
+    pbar.set_description("收集成功轨迹")
+
+    while success_count < num_trajectories and attempted_count < num_trajectories * 3:
+        attempted_count += 1
         
         # 重置环境，获取初始观测
         obs = env.reset()
@@ -735,14 +789,6 @@ def collect_sequence_data(env, num_trajectories=1000, max_steps=100):
         joint_angles = obs[:env.num_joints]
         joint_positions = obs[env.num_joints:-3].reshape(env.num_joints, 3)
         target_position = obs[-3:]
-
-        # 记录序列数据
-        sequence_joint_angles = []
-        sequence_joint_positions = []
-        
-        # 添加初始状态
-        sequence_joint_angles.append(joint_angles.copy())
-        sequence_joint_positions.append(joint_positions.copy())
 
         # 使用逆运动学生成参考轨迹
         trajectory = []
@@ -753,12 +799,12 @@ def collect_sequence_data(env, num_trajectories=1000, max_steps=100):
         min_distance = initial_distance
         steps_without_progress = 0
         
-        # 标记是否成功
-        success = False
+        # 标记当前轨迹是否成功
+        is_success = False
 
         # 检查目标是否可达 - 使用更严格的阈值
-        if initial_distance > 1.0:
-            # 目标距离过远，跳过此轨迹
+        if initial_distance > 0.8:
+            print(f"尝试 {attempted_count}: 目标距离过远 ({initial_distance:.4f})，可能不可达")
             continue
 
         # 直接使用逆运动学尝试求解目标位置
@@ -777,204 +823,158 @@ def collect_sequence_data(env, num_trajectories=1000, max_steps=100):
 
         # 如果直接IK解足够好，直接使用
         if direct_solution_error < 0.05:
+            print(f"尝试 {attempted_count}: 直接IK解足够好，误差: {direct_solution_error:.4f}")
             current_angles = np.array(
                 [p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
             action = direct_solution_angles - current_angles
 
             # 将动作分解为多个小步骤
-            num_substeps = 10
+            num_substeps = 5  # 每次动的范围是[-0.05, 0.05] --> 0.05米范围内动--> 每次动1cm左右
             for i in range(num_substeps):
                 sub_action = action / num_substeps
                 trajectory.append(sub_action)
-                
-                # 执行动作并记录状态
-                obs, reward, done, _ = env.step(sub_action)
-                
-                # 更新序列数据
-                current_angles = np.array([p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
-                current_positions = np.array([p.getLinkState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
-                sequence_joint_angles.append(current_angles.copy())
-                sequence_joint_positions.append(current_positions.reshape(env.num_joints, 3).copy())
-                
-                if done:
-                    success = True
-                    break
-            
-            # 检查最终距离
-            final_pos = env._get_end_effector_position()
-            final_distance = np.linalg.norm(final_pos - target_position)
-            
-            if final_distance < 0.05:
-                success = True
-            
-            if success:
-                # 将轨迹保存到数据集
-                dataset['initial_joint_angles'].append(joint_angles)
-                dataset['initial_joint_positions'].append(joint_positions)
-                dataset['target_positions'].append(target_position)
-                dataset['trajectories'].append(trajectory)
-                dataset['sequence_joint_angles'].append(np.array(sequence_joint_angles))
-                dataset['sequence_joint_positions'].append(np.array(sequence_joint_positions))
-                
-                success_count += 1
-                pbar.update(1)
-                pbar.set_postfix({"成功率": f"{success_count/attempt_count:.2%}"})
-            
-            continue
 
-        # 如果直接IK解不够好，使用迭代方法
-        for step in range(max_steps):
-            # 计算从当前位置到目标的方向
-            direction = target_position - current_pos
-            distance = np.linalg.norm(direction)
+            # 标记为成功
+            is_success = True
+        # else:
+        #     # 如果直接IK解不够好，使用迭代方法
+        #     for step in range(max_steps):
+        #         # 计算从当前位置到目标的方向
+        #         direction = target_position - current_pos
+        #         distance = np.linalg.norm(direction)
 
-            # 更新最小距离
-            if distance < min_distance:
-                min_distance = distance
-                steps_without_progress = 0
-            else:
-                steps_without_progress += 1
+        #         # 更新最小距离
+        #         if distance < min_distance:
+        #             min_distance = distance
+        #             steps_without_progress = 0
+        #         else:
+        #             steps_without_progress += 1
 
-            # 自适应步长：距离越近，步长越小
-            if distance > 0.5:
-                step_size = 0.05
-            elif distance > 0.2:
-                step_size = 0.03
-            elif distance > 0.1:
-                step_size = 0.02
-            else:
-                step_size = 0.01
+        #         # 自适应步长：距离越近，步长越小
+        #         if distance > 0.5:
+        #             step_size = 0.05
+        #         elif distance > 0.2:
+        #             step_size = 0.03
+        #         elif distance > 0.1:
+        #             step_size = 0.02
+        #         else:
+        #             step_size = 0.01
 
-            # 如果连续多步没有进展，尝试随机扰动
-            if steps_without_progress > 10:
-                # 添加随机扰动
-                random_direction = np.random.randn(3)
-                random_direction = random_direction / np.linalg.norm(random_direction)
-                direction = 0.7 * direction + 0.3 * random_direction
-                direction = direction / np.linalg.norm(direction)
-                step_size = 0.02
-                steps_without_progress = 0
+        #         # 如果连续多步没有进展，尝试随机扰动
+        #         if steps_without_progress > 10:
+        #             # 添加随机扰动
+        #             random_direction = np.random.randn(3)
+        #             random_direction = random_direction / np.linalg.norm(random_direction)
+        #             direction = 0.7 * direction + 0.3 * random_direction
+        #             direction = direction / np.linalg.norm(direction)
+        #             step_size = 0.02
+        #             steps_without_progress = 0
+        #             print(f"尝试 {attempted_count}: 添加随机扰动以跳出局部最小值")
 
-            # 到达目标或无法继续前进时终止
-            if distance < 0.05:  # 终止条件
-                success = True
-                break
+        #         # 到达目标或无法继续前进时终止
+        #         if distance < 0.05:  # 终止条件
+        #             is_success = True
+        #             print(f"尝试 {attempted_count}: 成功到达目标，最终距离: {distance:.4f}")
+        #             break
 
-            # 如果长时间没有进展且距离仍然很远，放弃当前轨迹
-            if steps_without_progress > 20 and distance > 0.2:
-                break
+        #         # 如果长时间没有进展且距离仍然很远，放弃当前轨迹
+        #         if steps_without_progress > 20 and distance > 0.2:
+        #             print(f"尝试 {attempted_count}: 无法继续接近目标，最小距离: {min_distance:.4f}")
+        #             break
 
-            # 标准化方向
-            if distance > 0:
-                direction = direction / distance
+        #         # 标准化方向
+        #         if distance > 0:
+        #             direction = direction / distance
 
-            # 使用逆运动学求解，尝试多个姿态
-            target_pos = current_pos + direction * min(step_size, distance)
+        #         # 使用逆运动学求解，尝试多个姿态
+        #         target_pos = current_pos + direction * min(step_size, distance)
 
-            # 尝试不同的末端执行器姿态
-            orientations = [
-                p.getQuaternionFromEuler([0, 0, 0]),  # 默认姿态
-                p.getQuaternionFromEuler([0, np.pi / 6, 0]),  # 绕Y轴旋转30度
-                p.getQuaternionFromEuler([np.pi / 6, 0, 0]),  # 绕X轴旋转30度
-                p.getQuaternionFromEuler([0, -np.pi / 6, 0]),  # 绕Y轴反向旋转30度
-                p.getQuaternionFromEuler([0, 0, np.pi / 6]),  # 绕Z轴旋转30度
-            ]
+        #         # 尝试不同的末端执行器姿态
+        #         orientations = [
+        #             p.getQuaternionFromEuler([0, 0, 0]),  # 默认姿态
+        #             p.getQuaternionFromEuler([0, np.pi / 6, 0]),  # 绕Y轴旋转30度
+        #             p.getQuaternionFromEuler([np.pi / 6, 0, 0]),  # 绕X轴旋转30度
+        #             p.getQuaternionFromEuler([0, -np.pi / 6, 0]),  # 绕Y轴反向旋转30度
+        #             p.getQuaternionFromEuler([0, 0, np.pi / 6]),  # 绕Z轴旋转30度
+        #         ]
 
-            best_solution = None
-            min_solution_error = float('inf')
+        #         best_solution = None
+        #         min_solution_error = float('inf')
 
-            for target_orn in orientations:
-                # 增加迭代次数以提高求解精度
-                joint_positions_target = p.calculateInverseKinematics(
-                    env.robot_id, env.num_joints - 1, target_pos,
-                    targetOrientation=target_orn,
-                    maxNumIterations=500,
-                    residualThreshold=0.0005
-                )
+        #         for target_orn in orientations:
+        #             # 增加迭代次数以提高求解精度
+        #             joint_positions_target = p.calculateInverseKinematics(
+        #                 env.robot_id, env.num_joints - 1, target_pos,
+        #                 targetOrientation=target_orn,
+        #                 maxNumIterations=500,
+        #                 residualThreshold=0.0005
+        #             )
 
-                # 验证解的质量 - 前向运动学检查
-                temp_angles = np.array(joint_positions_target[:env.num_joints])
+        #             # 验证解的质量 - 前向运动学检查
+        #             temp_angles = np.array(joint_positions_target[:env.num_joints])
 
-                # 检查关节限制
-                joint_limits_ok = True
-                for i, angle in enumerate(temp_angles):
-                    # 假设关节限制为 ±π
-                    if angle < -np.pi or angle > np.pi:
-                        joint_limits_ok = False
-                        break
+        #             # 检查关节限制
+        #             joint_limits_ok = True
+        #             for i, angle in enumerate(temp_angles):
+        #                 # 假设关节限制为 ±π
+        #                 if angle < -np.pi or angle > np.pi:
+        #                     joint_limits_ok = False
+        #                     break
 
-                if not joint_limits_ok:
-                    continue
+        #             if not joint_limits_ok:
+        #                 continue
 
-                # 使用前向运动学验证解的质量
-                test_pos = env.get_end_effector_position(temp_angles)
-                solution_error = np.linalg.norm(test_pos - target_pos)
+        #             # 使用前向运动学验证解的质量
+        #             test_pos = env.get_end_effector_position(temp_angles)
+        #             solution_error = np.linalg.norm(test_pos - target_pos)
 
-                if solution_error < min_solution_error:
-                    min_solution_error = solution_error
-                    best_solution = temp_angles
+        #             if solution_error < min_solution_error:
+        #                 min_solution_error = solution_error
+        #                 best_solution = temp_angles
 
-            # 如果没有找到合适的解，尝试减小步长
-            if best_solution is None or min_solution_error > 0.1:
-                # 减小步长重试
-                target_pos = current_pos + direction * min(step_size * 0.5, distance)
-                joint_positions_target = p.calculateInverseKinematics(
-                    env.robot_id, env.num_joints - 1, target_pos,
-                    targetOrientation=p.getQuaternionFromEuler([0, 0, 0]),
-                    maxNumIterations=500
-                )
-                best_solution = np.array(joint_positions_target[:env.num_joints])
+        #         # 如果没有找到合适的解，尝试减小步长
+        #         if best_solution is None or min_solution_error > 0.1:
+        #             # 减小步长重试
+        #             target_pos = current_pos + direction * min(step_size * 0.5, distance)
+        #             joint_positions_target = p.calculateInverseKinematics(
+        #                 env.robot_id, env.num_joints - 1, target_pos,
+        #                 targetOrientation=p.getQuaternionFromEuler([0, 0, 0]),
+        #                 maxNumIterations=500
+        #             )
+        #             best_solution = np.array(joint_positions_target[:env.num_joints])
 
-            # 转换为动作（关节角度增量）
-            current_angles = np.array(
-                [p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
-            action = best_solution - current_angles
+        #         # 转换为动作（关节角度增量）
+        #         current_angles = np.array(
+        #             [p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
+        #         action = best_solution - current_angles
 
-            # 限制动作幅度
-            action = np.clip(action, -0.05, 0.05)
+        #         # 限制动作幅度
+        #         action = np.clip(action, -0.05, 0.05)
 
-            # 记录动作
-            trajectory.append(action)
+        #         # 记录动作
+        #         trajectory.append(action)
 
-            # 执行动作
-            obs, reward, done, _ = env.step(action)
-            current_pos = env._get_end_effector_position()
-            
-            # 更新序列数据
-            current_angles = np.array([p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
-            current_positions = np.array([p.getLinkState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
-            sequence_joint_angles.append(current_angles.copy())
-            sequence_joint_positions.append(current_positions.reshape(env.num_joints, 3).copy())
+        #         # 执行动作
+        #         obs, reward, done, _ = env.step(action)
+        #         current_pos = env._get_end_effector_position()
 
-            if done:
-                success = True
-                break
+        #         if done:
+        #             is_success = True
+        #             print(f"尝试 {attempted_count}: 环境标记为完成，最终距离: {distance:.4f}")
+        #             break
 
         # 只有成功的轨迹才保存到数据集
-        if success:
-            dataset['initial_joint_angles'].append(joint_angles)
-            dataset['initial_joint_positions'].append(joint_positions)
+        if is_success:
+            dataset['joint_angles'].append(joint_angles)
+            dataset['joint_positions'].append(joint_positions)
             dataset['target_positions'].append(target_position)
             dataset['trajectories'].append(trajectory)
-            dataset['sequence_joint_angles'].append(np.array(sequence_joint_angles))
-            dataset['sequence_joint_positions'].append(np.array(sequence_joint_positions))
-            
             success_count += 1
             pbar.update(1)
-            pbar.set_postfix({"成功率": f"{success_count/attempt_count:.2%}"})
+            pbar.set_postfix({"成功率": f"{success_count}/{attempted_count} ({success_count/attempted_count*100:.1f}%)"})
 
     pbar.close()
-    
-    print(f"总共尝试: {attempt_count}, 成功轨迹: {success_count}, 成功率: {success_count/attempt_count:.2%}")
-    
-    # 将轨迹列表转换为张量
-    for i in range(len(dataset['trajectories'])):
-        dataset['trajectories'][i] = torch.tensor(np.array(dataset['trajectories'][i]), dtype=torch.float32)
-        dataset['sequence_joint_angles'][i] = torch.tensor(dataset['sequence_joint_angles'][i], dtype=torch.float32)
-        dataset['sequence_joint_positions'][i] = torch.tensor(dataset['sequence_joint_positions'][i], dtype=torch.float32)
-    
-    dataset['initial_joint_angles'] = torch.tensor(np.array(dataset['initial_joint_angles']), dtype=torch.float32)
-    dataset['initial_joint_positions'] = torch.tensor(np.array(dataset['initial_joint_positions']), dtype=torch.float32)
-    dataset['target_positions'] = torch.tensor(np.array(dataset['target_positions']), dtype=torch.float32)
-    
+    print(f"总共尝试了 {attempted_count} 次轨迹，成功收集了 {success_count} 条轨迹")
+    print(f"成功率: {success_count/attempted_count*100:.2f}%")
+
     return dataset
