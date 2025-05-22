@@ -204,11 +204,11 @@ class SequenceMLPPathModel(nn.Module):
         inputs = self._prepare_inputs(joint_angles, joint_positions, target_position)
         encoded_state = self.encoder(inputs)  #  [B, 256]
         # 运动学注意力
-        rotation_matrix = self.RotationAttention(encoded_state)
-        rotation_matrix = self.upDim_RotationAttention(rotation_matrix)
-        translation_vector = self.TranslationAttention(encoded_state)
-        translation_vector = self.upDim_TranslationAttention(translation_vector)
-        encoded_state = encoded_state+rotation_matrix+translation_vector
+        # rotation_matrix = self.RotationAttention(encoded_state)
+        # rotation_matrix = self.upDim_RotationAttention(rotation_matrix)
+        # translation_vector = self.TranslationAttention(encoded_state)
+        # translation_vector = self.upDim_TranslationAttention(translation_vector)
+        # encoded_state = encoded_state*rotation_matrix*translation_vector
 
         encoded_state = self.dropout(encoded_state)
         
@@ -229,10 +229,10 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
         model: SequenceMLPPathModel实例
         dataset: 包含训练数据的字典，格式为：
                 {
-                    'initial_joint_angles': tensor [num_samples, joint_dim],
-                    'initial_joint_positions': tensor [num_samples, joint_dim, position_dim],
-                    'target_positions': tensor [num_samples, position_dim],
-                    'trajectories': tensor [num_samples, seq_len, joint_dim]
+                    'joint_angles': list [num_samples, joint_dim],
+                    'joint_positions': list [num_samples, joint_dim, position_dim],
+                    'target_positions': list [num_samples, position_dim],
+                    'trajectories': list [num_samples, seq_len, joint_dim]
                 }
         num_epochs: 训练轮数
         batch_size: 批次大小
@@ -266,13 +266,39 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
         'trajectories': []
     }
     
+    # 首先检查数据集中是否有必要的键
+    required_keys = ['joint_angles', 'joint_positions', 'target_positions', 'trajectories']
+    for key in required_keys:
+        if key not in dataset:
+            raise KeyError(f"数据集中缺少必要的键: '{key}'")
+    
+    # 首先确保所有数据都是张量
+    for key in dataset:
+        if key != 'trajectories' and not isinstance(dataset[key][0], torch.Tensor):
+            # 使用numpy.array()先转换为单个numpy数组，再转换为张量，提高效率
+            dataset[key] = [torch.tensor(np.array(item), dtype=torch.float32) for item in dataset[key]]
+    
     # 处理每个轨迹
     for i in range(len(dataset['trajectories'])):
         traj = dataset['trajectories'][i]
+        # 检查轨迹是否为张量，如果不是则转换为张量
+        if not isinstance(traj, torch.Tensor):
+            # 使用numpy.array()先转换为单个numpy数组，再转换为张量，提高效率
+            traj = torch.tensor(np.array(traj), dtype=torch.float32)
+            
         seq_joint_angles = dataset['sequence_joint_angles'][i] if 'sequence_joint_angles' in dataset else None
+        if seq_joint_angles is not None and not isinstance(seq_joint_angles, torch.Tensor):
+            seq_joint_angles = torch.tensor(np.array(seq_joint_angles), dtype=torch.float32)
+            
         seq_joint_positions = dataset['sequence_joint_positions'][i] if 'sequence_joint_positions' in dataset else None
+        if seq_joint_positions is not None and not isinstance(seq_joint_positions, torch.Tensor):
+            seq_joint_positions = torch.tensor(np.array(seq_joint_positions), dtype=torch.float32)
+            
         target_position = dataset['target_positions'][i]
+        if not isinstance(target_position, torch.Tensor):
+            target_position = torch.tensor(np.array(target_position), dtype=torch.float32)
         
+        # 现在traj已经是张量，可以安全地调用size()方法
         traj_len = traj.size(0)
         
         if traj_len <= max_seq_len:
@@ -285,8 +311,9 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
                 processed_data['initial_joint_angles'].append(seq_joint_angles[0])
                 processed_data['initial_joint_positions'].append(seq_joint_positions[0])
             else:
-                processed_data['initial_joint_angles'].append(dataset['initial_joint_angles'][i])
-                processed_data['initial_joint_positions'].append(dataset['initial_joint_positions'][i])
+                # 使用joint_angles和joint_positions作为初始状态，而不是initial_joint_angles
+                processed_data['initial_joint_angles'].append(dataset['joint_angles'][i])
+                processed_data['initial_joint_positions'].append(dataset['joint_positions'][i])
                 
             processed_data['target_positions'].append(target_position)
             processed_data['trajectories'].append(processed_traj)
@@ -302,9 +329,9 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
                 processed_data['initial_joint_angles'].append(seq_joint_angles[start_idx])
                 processed_data['initial_joint_positions'].append(seq_joint_positions[start_idx])
             else:
-                # 如果没有序列状态数据，使用初始状态
-                processed_data['initial_joint_angles'].append(dataset['initial_joint_angles'][i])
-                processed_data['initial_joint_positions'].append(dataset['initial_joint_positions'][i])
+                # 使用joint_angles和joint_positions作为初始状态，而不是initial_joint_angles
+                processed_data['initial_joint_angles'].append(dataset['joint_angles'][i])
+                processed_data['initial_joint_positions'].append(dataset['joint_positions'][i])
                 
             processed_data['target_positions'].append(target_position)
             processed_data['trajectories'].append(processed_traj)
@@ -345,7 +372,7 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
     best_test_loss = float('inf')
     best_model_state = None
     patience_counter = 0
-    early_stop_patience = 20
+    early_stop_patience = 10
     
     # 训练循环
     for epoch in range(num_epochs):
@@ -600,7 +627,7 @@ def visualize_model_trajectory(model, env, joint_angles=None, joint_positions=No
     
     # 创建权重数组 - 前面的动作权重更大
     # 使用指数衰减权重，前面的动作权重更大
-    def create_weights(length, decay_factor=0.9):
+    def create_weights(length, decay_factor=0.8):
         weights = np.array([decay_factor ** i for i in range(length)])
         return weights / weights.sum()  # 归一化权重
     
@@ -624,12 +651,11 @@ def visualize_model_trajectory(model, env, joint_angles=None, joint_positions=No
             )
             predicted_trajectory = predicted_trajectory.squeeze(0).cpu().numpy()
         
-        # 计算要执行的步数 - 最多执行预测的前10步
-        steps_to_execute = min(10, len(predicted_trajectory))
+        # 计算要执行的步数 - 最多执行预测的前5步
+        steps_to_execute = min(3, len(predicted_trajectory))
         
         # 创建权重 - 前面的动作权重更大
-        weights = create_weights(steps_to_execute)
-        
+        weights = create_weights(7)
         # 执行加权后的动作序列
         for i in range(steps_to_execute):
             if current_step >= max_steps:
@@ -641,31 +667,31 @@ def visualize_model_trajectory(model, env, joint_angles=None, joint_positions=No
             else:
                 # 对未来几步的动作进行加权平均
                 action = np.zeros_like(predicted_trajectory[0])
-                for j in range(min(5, steps_to_execute - i)):
-                    action += weights[j] * predicted_trajectory[i + j]
-            
-            # 确保动作在合理范围内
-            action = np.clip(action, -1.0, 1.0)
-            
-            # 执行动作
-            next_obs, reward, done, _ = env.step(action)
-            current_step += 1
-            
-            # 提取当前状态
-            current_joint_angles = next_obs[:env.num_joints]
-            current_joint_positions = next_obs[env.num_joints:-3].reshape(env.num_joints, 3)
-            
-            # 记录当前状态
-            traj_data.append({
-                'joint_angles': current_joint_angles.copy(),
-                'joint_positions': current_joint_positions.copy(),
-                'target_position': current_target_position.copy()
-            })
-            
-            if done:
-                print(f"目标达成！步数: {current_step}")
-                break
+                for j in range(min(3, steps_to_execute - i)):
+                    action += weights*predicted_trajectory[i + j]
+        # action = predicted_trajectory[0]
+        # 确保动作在合理范围内
+        action = np.clip(action, -0.001, 0.001)
         
+        # 执行动作
+        next_obs, reward, done, _ = env.step(action)
+        current_step += 1
+        
+        # 提取当前状态
+        current_joint_angles = next_obs[:env.num_joints]
+        current_joint_positions = next_obs[env.num_joints:-3].reshape(env.num_joints, 3)
+        
+        # 记录当前状态
+        traj_data.append({
+            'joint_angles': current_joint_angles.copy(),
+            'joint_positions': current_joint_positions.copy(),
+            'target_position': current_target_position.copy()
+        })
+        
+        if done:
+            print(f"目标达成！步数: {current_step}")
+            break
+    
         if done:
             break
     
@@ -925,8 +951,8 @@ def test_model_visualization():
         visualize_model_trajectory(model, env, output_file="mlp_model_trajectory.gif", 
                                 fps=10, max_steps=10000)
         print("轨迹生成完成！")
-    except Exception as e:
-        print(f"轨迹生成过程中出错: {e}")
+    # except Exception as e:
+    #     print(f"轨迹生成过程中出错: {e}")
     finally:
         # 确保环境被关闭
         env.close()
@@ -942,28 +968,31 @@ if __name__ == "__main__":
     model = SequenceMLPPathModel(joint_dim=7, position_dim=3, hidden_dim=256, seq_len=30)
     
     # 加载数据集
-    from robotEnv import RoboticArmEnv, collect_sequence_data
+    from robotEnv import RoboticArmEnv, collect_sequence_data2
     env = RoboticArmEnv()
-    dataset = collect_sequence_data(env, num_trajectories=1, max_steps=200)
-    
+    dataset = collect_sequence_data2(env, num_trajectories=2000)
+    data_path = r'C:/DiskD/trae_doc/robot_gym/result/robot_trajectory_data.npy'
+    print(f"数据收集完成，正在保存到 {data_path}...")
+    np.save(data_path, dataset)
+    dataset = np.load(data_path, allow_pickle=True).item()
     # 训练模型
-    # model, train_losses, test_losses = train_sequence_mlp_path_model(
-    #     model, 
-    #     dataset, 
-    #     num_epochs=1000, 
-    #     batch_size=64, 
-    #     lr=1e-5, 
-    #     weight_decay=5e-4,
-    #     test_ratio=0.1,
-    #     save_dir='model_results'
-    # )
+    model, train_losses, test_losses = train_sequence_mlp_path_model(
+        model, 
+        dataset, 
+        num_epochs=1000, 
+        batch_size=64, 
+        lr=1e-4, 
+        weight_decay=3e-4,
+        test_ratio=0.1,
+        save_dir='model_results'
+    )
     
     # 生成轨迹示例
-    sample_idx = np.random.randint(0, len(dataset['initial_joint_angles']))
-    initial_joint_angles = dataset['initial_joint_angles'][sample_idx]
-    initial_joint_positions = dataset['initial_joint_positions'][sample_idx]
-    target_position = dataset['target_positions'][sample_idx]
+    # sample_idx = np.random.randint(0, len(dataset['initial_joint_angles']))
+    # initial_joint_angles = dataset['initial_joint_angles'][sample_idx]
+    # initial_joint_positions = dataset['initial_joint_positions'][sample_idx]
+    # target_position = dataset['target_positions'][sample_idx]
     
-    trajectory = generate_sequence_trajectory(model, initial_joint_angles, initial_joint_positions, target_position)
+    # trajectory = generate_sequence_trajectory(model, initial_joint_angles, initial_joint_positions, target_position)
     test_model_visualization()
     # 可视化轨迹
