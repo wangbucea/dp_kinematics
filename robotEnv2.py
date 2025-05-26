@@ -903,3 +903,271 @@ def collect_sequence_data2(env, num_trajectories=1000, max_steps=100):
     print(f"成功率: {success_count/attempted_count*100:.2f}%")
 
     return dataset
+
+
+def collect_sequence_data3(env, num_trajectories=1000, max_steps=30, output_file="robot_trajectory_data.h5", batch_size=10000):
+    """
+    收集机器人轨迹数据并保存为HDF5格式
+    
+    参数:
+        env: 机器人环境
+        num_trajectories: 需要收集的轨迹总数
+        max_steps: 每条轨迹的最大步数
+        output_file: 输出的HDF5文件路径
+        batch_size: 每批处理的轨迹数量，用于控制内存使用
+    
+    返回:
+        成功收集的轨迹数量
+    """
+    import h5py
+    import os
+    import time
+    import traceback
+    from datetime import datetime
+    
+    # 检查是否已存在部分完成的数据文件
+    resume_collection = False
+    current_trajectory_count = 0
+    
+    if os.path.exists(output_file):
+        try:
+            with h5py.File(output_file, 'r') as f:
+                if 'metadata' in f and 'completed_trajectories' in f['metadata']:
+                    current_trajectory_count = f['metadata']['completed_trajectories'][()]
+                    if current_trajectory_count < num_trajectories:
+                        resume_collection = True
+                        print(f"发现已有数据文件，已完成 {current_trajectory_count}/{num_trajectories} 条轨迹，将继续收集")
+                    else:
+                        print(f"已完成所有 {num_trajectories} 条轨迹的收集，无需继续")
+                        return current_trajectory_count
+        except Exception as e:
+            print(f"读取现有数据文件时出错: {e}")
+            print("将创建新的数据文件")
+    
+    # 创建或打开HDF5文件
+    try:
+        if resume_collection:
+            h5_file = h5py.File(output_file, 'a')
+        else:
+            h5_file = h5py.File(output_file, 'w')
+            
+            # 创建数据集结构
+            h5_file.create_group('joint_angles')
+            h5_file.create_group('joint_positions')
+            h5_file.create_group('target_positions')
+            h5_file.create_group('trajectories')
+            h5_file.create_group('sequence_joint_angles')
+            h5_file.create_group('sequence_joint_positions')
+            
+            # 创建元数据组
+            metadata = h5_file.create_group('metadata')
+            metadata.create_dataset('total_trajectories', data=num_trajectories)
+            metadata.create_dataset('completed_trajectories', data=0)
+            metadata.create_dataset('creation_time', data=str(datetime.now()))
+            metadata.create_dataset('last_update', data=str(datetime.now()))
+    except Exception as e:
+        print(f"创建HDF5文件时出错: {e}")
+        return 0
+    
+    # 记录成功到达目标的轨迹数量
+    success_count = current_trajectory_count
+    attempted_count = 0
+    batch_count = 0
+    
+    # 临时存储当前批次的数据
+    batch_data = {
+        'joint_angles': [],
+        'joint_positions': [],
+        'target_positions': [],
+        'trajectories': [],
+        'sequence_joint_angles': [],
+        'sequence_joint_positions': []
+    }
+    
+    # 使用tqdm创建进度条
+    pbar = tqdm(total=num_trajectories, initial=current_trajectory_count)
+    pbar.set_description("收集成功轨迹")
+    
+    try:
+        while success_count < num_trajectories and attempted_count < num_trajectories * 3:
+            attempted_count += 1
+            
+            # 重置环境，获取初始观测
+            obs = env.reset()
+
+            # 解析初始观测
+            joint_angles = obs[:env.num_joints]
+            joint_positions = obs[env.num_joints:-3].reshape(env.num_joints, 3)
+            target_position = obs[-3:]
+
+            # 使用逆运动学生成参考轨迹
+            trajectory = []
+            sequence_joint_angles_list = []  # 添加这个列表来记录每一步的关节角度
+            sequence_joint_positions_list = []  # 添加这个列表来记录每一步的关节位置
+            
+            current_pos = env._get_end_effector_position()
+            current_angles = np.array([p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
+            
+            # 记录初始距离
+            initial_distance = np.linalg.norm(target_position - current_pos)
+            min_distance = initial_distance
+            steps_without_progress = 0
+            
+            # 标记当前轨迹是否成功
+            is_success = False
+
+            # 检查目标是否可达 - 使用更严格的阈值
+            if initial_distance > 0.8:
+                if attempted_count % 100 == 0:  # 减少日志输出频率
+                    print(f"尝试 {attempted_count}: 目标距离过远 ({initial_distance:.4f})，可能不可达")
+                continue
+
+            # 直接使用逆运动学尝试求解目标位置
+            target_orn = p.getQuaternionFromEuler([0, 0, 0])
+            direct_ik_solution = p.calculateInverseKinematics(
+                env.robot_id, env.num_joints - 1, target_position,
+                targetOrientation=target_orn,
+                maxNumIterations=1000,
+                residualThreshold=0.0001
+            )
+
+            # 验证直接IK解的质量
+            direct_solution_angles = np.array(direct_ik_solution[:env.num_joints])
+            direct_solution_pos = env.get_end_effector_position(direct_solution_angles)
+            direct_solution_error = np.linalg.norm(direct_solution_pos - target_position)
+
+            # 如果直接IK解足够好，直接使用
+            if direct_solution_error < 0.05:
+                if attempted_count % 100 == 0:  # 减少日志输出频率
+                    print(f"尝试 {attempted_count}: 直接IK解足够好，误差: {direct_solution_error:.4f}")
+                current_angles = np.array(
+                    [p.getJointState(env.robot_id, joint_id)[0] for joint_id in range(env.num_joints)])
+                action = direct_solution_angles - current_angles
+
+                # 将动作分解为多个小步骤
+                num_substeps = 30
+                for i in range(num_substeps):
+                    sub_action = action / num_substeps
+                    trajectory.append(sub_action)
+                    
+                    # 更新当前关节角度和位置
+                    current_angles = current_angles + sub_action
+                    # 设置关节状态以获取新的关节位置
+                    for j, joint_id in enumerate(range(env.num_joints)):
+                        p.resetJointState(env.robot_id, joint_id, current_angles[j])
+                    
+                    # 获取新的关节位置
+                    joint_positions_new = []
+                    for joint_id in range(env.num_joints):
+                        joint_info = p.getLinkState(env.robot_id, joint_id)
+                        joint_positions_new.extend(joint_info[0])  # 链接位置
+                    joint_positions_new = np.array(joint_positions_new).reshape(env.num_joints, 3)
+                    
+                    # 记录序列数据
+                    sequence_joint_angles_list.append(current_angles.copy())
+                    sequence_joint_positions_list.append(joint_positions_new.copy())
+
+                # 标记为成功
+                is_success = True
+            
+            # 只有成功的轨迹才保存到数据集
+            if is_success:
+                # 将数据添加到当前批次
+                batch_data['joint_angles'].append(joint_angles)
+                batch_data['joint_positions'].append(joint_positions)
+                batch_data['target_positions'].append(target_position)
+                batch_data['trajectories'].append(trajectory)
+                batch_data['sequence_joint_angles'].append(sequence_joint_angles_list)
+                batch_data['sequence_joint_positions'].append(sequence_joint_positions_list)
+                
+                success_count += 1
+                batch_count += 1
+                pbar.update(1)
+                pbar.set_postfix({"成功率": f"{success_count}/{attempted_count} ({success_count/attempted_count*100:.1f}%)"})
+                
+                # 当达到批次大小或完成所有轨迹时，将数据写入HDF5文件
+                if batch_count >= batch_size or success_count >= num_trajectories:
+                    # 将批次数据保存到HDF5文件
+                    save_batch_to_hdf5(h5_file, batch_data, current_trajectory_count)
+                    
+                    # 更新元数据
+                    h5_file['metadata']['completed_trajectories'][()] = success_count
+                    h5_file['metadata']['last_update'][()] = str(datetime.now())
+                    
+                    # 确保数据写入磁盘
+                    h5_file.flush()
+                    
+                    # 重置批次数据和计数器
+                    for key in batch_data:
+                        batch_data[key] = []
+                    current_trajectory_count = success_count
+                    batch_count = 0
+                    
+                    # 打印进度信息
+                    print(f"已保存 {success_count}/{num_trajectories} 条轨迹到 {output_file}")
+    
+    except KeyboardInterrupt:
+        print("\n用户中断数据收集过程")
+    except Exception as e:
+        print(f"\n数据收集过程中出错: {e}")
+        traceback.print_exc()
+    finally:
+        # 确保保存最后一批数据（如果有）
+        if batch_count > 0:
+            try:
+                save_batch_to_hdf5(h5_file, batch_data, current_trajectory_count)
+                h5_file['metadata']['completed_trajectories'][()] = success_count
+                h5_file['metadata']['last_update'][()] = str(datetime.now())
+                h5_file.flush()
+            except Exception as e:
+                print(f"保存最后一批数据时出错: {e}")
+        
+        # 关闭HDF5文件
+        h5_file.close()
+        pbar.close()
+    
+    print(f"总共尝试了 {attempted_count} 次轨迹，成功收集了 {success_count} 条轨迹")
+    print(f"成功率: {success_count/attempted_count*100:.2f}%")
+    print(f"数据已保存到: {output_file}")
+    
+    return success_count
+
+def save_batch_to_hdf5(h5_file, batch_data, start_idx):
+    """
+    将一批数据保存到HDF5文件
+    
+    参数:
+        h5_file: 打开的HDF5文件对象
+        batch_data: 包含批次数据的字典
+        start_idx: 起始索引
+    """
+    # 获取批次大小
+    batch_size = len(batch_data['joint_angles'])
+    if batch_size == 0:
+        return
+    
+    # 遍历批次中的每条轨迹
+    for i in range(batch_size):
+        idx = start_idx + i
+        idx_str = str(idx)
+        
+        # 保存关节角度
+        h5_file['joint_angles'].create_dataset(idx_str, data=np.array(batch_data['joint_angles'][i]))
+        
+        # 保存关节位置
+        h5_file['joint_positions'].create_dataset(idx_str, data=np.array(batch_data['joint_positions'][i]))
+        
+        # 保存目标位置
+        h5_file['target_positions'].create_dataset(idx_str, data=np.array(batch_data['target_positions'][i]))
+        
+        # 保存轨迹
+        trajectory_data = np.array(batch_data['trajectories'][i])
+        h5_file['trajectories'].create_dataset(idx_str, data=trajectory_data)
+        
+        # 保存序列关节角度
+        seq_joint_angles = np.array(batch_data['sequence_joint_angles'][i])
+        h5_file['sequence_joint_angles'].create_dataset(idx_str, data=seq_joint_angles)
+        
+        # 保存序列关节位置
+        seq_joint_positions = np.array(batch_data['sequence_joint_positions'][i])
+        h5_file['sequence_joint_positions'].create_dataset(idx_str, data=seq_joint_positions)
