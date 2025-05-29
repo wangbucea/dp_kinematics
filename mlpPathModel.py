@@ -3,19 +3,73 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
-import math
 from tqdm import tqdm
 import pybullet as p
-import pybullet_data
+import h5py
+from torch.utils.data import Dataset
 
-class sinLU(nn.Module):
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class HDF5Dataset(Dataset):
     """
-     sinLU
+    支持大型HDF5文件的流式数据集类
     """
-    def __init__(self):
-        super(sinLU, self).__init__()
-    def forward(self, x):
-        return (x + torch.sin(x))*torch.sigmoid(x)
+    def __init__(self, h5_file_path, max_seq_len=30, cache_size=1000):
+        self.h5_file_path = h5_file_path
+        self.max_seq_len = max_seq_len
+        self.cache_size = cache_size
+        self.cache = {}
+        self.cache_keys = []
+        
+        # 打开文件获取数据长度
+        with h5py.File(h5_file_path, 'r') as f:
+            self.length = len(f['joint_angles'])
+            
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        # 检查缓存
+        if idx in self.cache:
+            return self.cache[idx]
+            
+        # 从文件读取数据
+        with h5py.File(self.h5_file_path, 'r') as f:
+            idx_str = str(idx)
+            
+            # 读取数据
+            initial_joint_angles = torch.tensor(f['joint_angles'][idx_str][:], dtype=torch.float32)
+            initial_joint_positions = torch.tensor(f['joint_positions'][idx_str][:], dtype=torch.float32)
+            target_position = torch.tensor(f['target_positions'][idx_str][:], dtype=torch.float32)
+            sequence_joint_angles = torch.tensor(f['sequence_joint_angles'][idx_str][:], dtype=torch.float32)
+            
+            # 处理序列长度
+            if sequence_joint_angles.size(0) > self.max_seq_len:
+                sequence_joint_angles = sequence_joint_angles[:self.max_seq_len]
+            elif sequence_joint_angles.size(0) < self.max_seq_len:
+                padding = torch.zeros(self.max_seq_len - sequence_joint_angles.size(0), 
+                                    sequence_joint_angles.size(1), dtype=torch.float32)
+                sequence_joint_angles = torch.cat([sequence_joint_angles, padding], dim=0)
+            
+            # 获取目标关节角度
+            target_joint_angles = sequence_joint_angles[-1]
+            for j in range(sequence_joint_angles.size(0)-1, -1, -1):
+                if torch.sum(torch.abs(sequence_joint_angles[j])) > 1e-6:
+                    target_joint_angles = sequence_joint_angles[j]
+                    break
+            
+            data = (initial_joint_angles, initial_joint_positions, target_position, 
+                   target_joint_angles, sequence_joint_angles)
+            
+            # 更新缓存
+            if len(self.cache) >= self.cache_size:
+                # 移除最旧的缓存项
+                oldest_key = self.cache_keys.pop(0)
+                del self.cache[oldest_key]
+            
+            self.cache[idx] = data
+            self.cache_keys.append(idx)
+            
+            return data
 
 class MLPEncoder(nn.Module):
     """
@@ -26,80 +80,20 @@ class MLPEncoder(nn.Module):
     def __init__(self, input_size, output_size):
         super(MLPEncoder, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_size, 768), nn.PReLU(), nn.Dropout(0.1),
-            nn.Linear(768, 512), nn.PReLU(), nn.Dropout(0.1),
-            nn.Linear(512, 384), nn.PReLU(), nn.Dropout(0.1),
-            nn.Linear(384, output_size)
+            nn.Linear(input_size, 512), nn.GELU(), nn.LayerNorm(512), nn.Dropout(0.1),
+            nn.Linear(512, 768), nn.GELU(), nn.LayerNorm(768),nn.Dropout(0.1),
+            nn.Linear(768, 896), nn.GELU(), nn.LayerNorm(896),nn.Dropout(0.1),
+            nn.Linear(896, output_size)
         )
     def forward(self, x):
         return self.encoder(x)
-
-class RotationMLP(nn.Module):
-    """旋转矩阵生成模块：学习sin/cos的多项式近似"""
-    def __init__(self, input_dim, hidden_size=64, degree=3):
-        super().__init__()
-        self.degree = degree
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_size),
-            nn.PReLU(),
-            nn.Linear(hidden_size, hidden_size//2),
-            nn.PReLU(),
-            nn.Linear(hidden_size//2, degree*2)  # 输出sin和cos的系数
-        )
-        self.A = nn.Parameter(torch.tensor(1.0), requires_grad=True)  # 初始化 a
-        self.B = nn.Parameter(torch.tensor(0.0), requires_grad=True)  # 初始化 b
-        self.A2 = nn.Parameter(torch.tensor(1.0), requires_grad=True)  # 初始化 a
-        self.B2 = nn.Parameter(torch.tensor(0.0), requires_grad=True)  # 初始化 b
-    def forward(self, theta):
-        # theta形状: (batch_size, 1)
-        B = theta.shape[0]
-        coeffs = self.net(theta)  # (batch, degree*2)
-        sin_coeffs = coeffs[..., :self.degree]
-        cos_coeffs = coeffs[..., self.degree:]
-        
-        # 构建多项式近似
-        # angles = theta.unsqueeze(-1)  # (batch, 1, 1)
-        # powers = torch.arange(1, 2*self.degree+1, 2, device=theta.device).float()  # 奇次幂
-        # # 计算多项式项：x^1, x^3, x^5...
-        # # 通过sin(ax+b) 来近似
-        # terms = angles.pow(powers)  # (batch, 1, degree)
-
-        # 组合sin和cos近似
-        # sin_approx = (sin_coeffs.unsqueeze(1) * terms).sum(dim=-1)  # (batch, 1)
-        # cos_approx = (cos_coeffs.unsqueeze(1) * terms).sum(dim=-1)  # (batch, 1)
-        sin_approx = self.A*sin_coeffs+self.B
-        cos_approx = self.A2*cos_coeffs+self.B2
-        # 构建2x2旋转矩阵
-        rot_matrix = torch.cat([cos_approx, -sin_approx, sin_approx, cos_approx], dim=-1)
-        
-        return rot_matrix.view(B, -1)  # (batch, 4)
-
-class TranslationMLP(nn.Module):
-    """平移向量生成模块：学习连杆参数到位移的映射"""
-    def __init__(self, input_dim, hidden_size=64):
-        super().__init__()
-        self.ac = sinLU()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_size),
-            self.ac,
-            nn.Linear(hidden_size, hidden_size),
-            self.ac,
-            nn.Linear(hidden_size, 3)  # 输出dx, dy, dz
-        )
-
-    def forward(self, link_params):
-        # link_params形状: (batch, 3) [d, a, alpha]
-        B = link_params.shape[0]
-        # 直接将link_params作为输入
-        link_params = self.net(link_params)  # Flatten the lin
-        link_params = link_params.view(B, -1)
-        return link_params  # (batch, 3)
 
 class MLPPathGenerator(nn.Module):
     """
     路径生成器：生成机械臂的运动轨迹
     """
-    def __init__(self, input_size, output_size, hidden_sizes=[1280, 896, 512, 384, 256, 128, 64, 32]):
+    def __init__(self, input_size, output_size, hidden_sizes=[1280, 1024, 896, 768, 640,  512, 384,  256]):
+        # 1280, 896, 512, 384, 256, 128, 64, 32                            1280 1024 896 768 640  512 384  256
         super(MLPPathGenerator, self).__init__()
         
         layers = []
@@ -108,10 +102,10 @@ class MLPPathGenerator(nn.Module):
         # 构建隐藏层
         for hidden_size in hidden_sizes:
             layers.append(nn.Linear(prev_size, hidden_size))
-            layers.append(nn.PReLU())
             layers.append(nn.Dropout(0.1))
+            layers.append(nn.LayerNorm(hidden_size))
+            layers.append(nn.GELU())
             prev_size = hidden_size
-        
         # 输出层
         layers.append(nn.Linear(hidden_sizes[-1], output_size))
         
@@ -119,13 +113,70 @@ class MLPPathGenerator(nn.Module):
 
     def forward(self, x):
         return self.mlp(x)
+
+class EnhancedMLPPathGenerator(nn.Module):
+    """
+    增强版路径生成器：添加残差连接和注意力机制
+    """
+    def __init__(self, input_size, output_size, hidden_sizes=[1280, 1024, 896, 768, 640, 512, 384, 256]):
+        super(EnhancedMLPPathGenerator, self).__init__()
+        
+        self.layers = nn.ModuleList()
+        self.skip_connections = nn.ModuleList()
+        prev_size = input_size
+        
+        # 构建隐藏层和残差连接
+        for i, hidden_size in enumerate(hidden_sizes):
+            # 主层
+            self.layers.append(nn.Sequential(
+                nn.Linear(prev_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ))
+            
+            # 残差连接（如果维度匹配）
+            if i > 0 and hidden_sizes[i-1] == hidden_size:
+                self.skip_connections.append(True)
+            else:
+                self.skip_connections.append(False)
+                
+            prev_size = hidden_size
+        
+        # 输出层
+        self.output_layer = nn.Linear(hidden_sizes[-1], output_size)
+        
+        # 自注意力层
+        self.attention = nn.MultiheadAttention(hidden_sizes[-1], num_heads=4, batch_first=True)
+    
+    def forward(self, x):
+        # 保存中间结果用于残差连接
+        residuals = []
+        
+        # 前向传播通过隐藏层
+        for i, layer in enumerate(self.layers):
+            if i > 0 and self.skip_connections[i]:
+                x = layer(x) + residuals[-1]  # 残差连接
+            else:
+                x = layer(x)
+            residuals.append(x)
+        
+        # 重塑以适应注意力层 [batch_size, 1, hidden_dim]
+        x_reshaped = x.unsqueeze(1)
+        
+        # 应用自注意力
+        attn_output, _ = self.attention(x_reshaped, x_reshaped, x_reshaped)
+        x = x + attn_output.squeeze(1)  # 残差连接
+        
+        # 输出层
+        return self.output_layer(x)
    
 class BidirectionalPathGenerator(nn.Module):
     """
     双向轨迹生成器：从起点和终点同时生成轨迹，然后融合
     借鉴RRT*的双向搜索思想
     """
-    def __init__(self, input_size, output_size, hidden_sizes=[1280, 896, 512, 384, 256, 128, 64, 32], seq_len=30):
+    def __init__(self, input_size, output_size, hidden_sizes=[1280, 1024, 896, 768, 640,  512, 384,  256], seq_len=30):
         super(BidirectionalPathGenerator, self).__init__()
         
         self.seq_len = seq_len
@@ -150,7 +201,8 @@ class BidirectionalPathGenerator(nn.Module):
         # 轨迹融合网络
         self.fusion_network = nn.Sequential(
             nn.Linear(output_size * 2, output_size),
-            nn.PReLU(),
+            nn.LayerNorm(output_size),
+            nn.GELU(),
             nn.Linear(output_size, output_size)
         )
     def forward(self, start_encoding, end_encoding):
@@ -209,38 +261,26 @@ class BidirectionalSequenceMLPPathModel(nn.Module):
     def __init__(self, 
                  joint_dim=7,           # 关节角度维度
                  position_dim=3,        # 位置维度
-                 hidden_dim=128,        # 隐藏层维度
+                 hidden_dim=1024,        # 隐藏层维度
                  seq_len=30,            # 生成轨迹的长度
-                 dropout=0.1):          # Dropout比率
+                 dropout=0.1,
+                 num_attention_layers=2): # 注意力层数量
         super(BidirectionalSequenceMLPPathModel, self).__init__()
         
         # 计算输入维度：关节角度 + 关节位置 + 目标位置
-        self.input_dim = joint_dim + joint_dim * position_dim + position_dim
+        # self.input_dim = joint_dim + joint_dim * position_dim + position_dim
+        self.input_dim = joint_dim + position_dim
         self.joint_dim = joint_dim
         self.position_dim = position_dim
         self.seq_len = seq_len
+        self.hidden_dim = hidden_dim
+        self.training_mode = True  # 默认为训练模式
         
         # 起点编码器
-        self.start_encoder = MLPEncoder(self.input_dim, hidden_dim)
+        self.start_encoder = MLPEncoder(self.input_dim, hidden_dim).to(device)
         
         # 终点编码器
         self.end_encoder = MLPEncoder(self.input_dim, hidden_dim)
-        
-        # 运动学注意力
-        self.rotation_attention = RotationMLP(hidden_dim)
-        self.translation_attention = TranslationMLP(hidden_dim)
-
-        self.upDim_rotation_attention = nn.Sequential(
-            nn.Linear(12, hidden_dim),
-            nn.PReLU(),
-            nn.Dropout(0.1),
-        )
-        
-        self.upDim_translation_attention = nn.Sequential(
-            nn.Linear(3, hidden_dim),
-            nn.PReLU(),
-            nn.Dropout(0.1),
-        )
         
         # 双向轨迹生成器
         self.bidirectional_generator = BidirectionalPathGenerator(
@@ -248,45 +288,44 @@ class BidirectionalSequenceMLPPathModel(nn.Module):
             joint_dim,
             seq_len=seq_len
         )
+        
+        # 双向LSTM层，用于捕捉时序依赖
         self.lstm = nn.LSTM(
-                input_size=joint_dim,
-                hidden_size=joint_dim*2,
-                num_layers=2,
-                batch_first=True,
-                dropout=dropout if dropout > 0 else 0,
-                bidirectional=True
-            )
+            input_size=joint_dim,
+            hidden_size=joint_dim*2,
+            num_layers=2,
+            batch_first=True,
+            dropout=dropout if dropout > 0 else 0,
+            bidirectional=True
+        )
+        
+        self.layer_norm1 = nn.LayerNorm(joint_dim*4)
+        self.layer_norm2 = nn.LayerNorm(joint_dim)
+        
+        # LSTM输出投影
         self.lstm_projection = nn.Linear(joint_dim*4, joint_dim)
+        
         self.dropout = nn.Dropout(dropout)
         
-        # 初始化参数
-        self._init_parameters()
-    
-    def _init_parameters(self):
-        """初始化模型参数"""
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-    
-    def _prepare_inputs(self, joint_angles, joint_positions, target_position):
+    def _prepare_inputs(self, joint_angles, target_position):
         """准备编码器的输入"""
         # 确保所有输入至少是二维的
         if joint_angles.dim() == 1:
             joint_angles = joint_angles.unsqueeze(0)
-        if joint_positions.dim() == 1:
-            joint_positions = joint_positions.unsqueeze(0)
+        # if joint_positions.dim() == 1:
+        #     joint_positions = joint_positions.unsqueeze(0)
         if target_position.dim() == 1:
             target_position = target_position.unsqueeze(0)
         
         batch_size = joint_angles.size(0)
         
         # 合并输入特征
-        joint_positions_flat = joint_positions.reshape(batch_size, -1)
-        inputs = torch.cat([joint_angles, joint_positions_flat, target_position], dim=1)
+        # joint_positions_flat = joint_positions.reshape(batch_size, -1)
+        inputs = torch.cat([joint_angles, target_position], dim=1)
         
         return inputs
-    
-    def forward(self, joint_angles, joint_positions, target_position, target_joint_angles=None):
+        
+    def forward(self, joint_angles,joint_positions, target_position, target_joint_angles=None):
         """
         前向传播 - 双向生成轨迹
         Args:
@@ -294,6 +333,7 @@ class BidirectionalSequenceMLPPathModel(nn.Module):
             joint_positions: 初始关节位置 [batch_size, joint_dim, position_dim]
             target_position: 目标位置 [batch_size, position_dim]
             target_joint_angles: 目标关节角度 [batch_size, joint_dim]，如果为None则使用零向量
+            teacher_forcing_ratio: 教师强制比例，用于训练时
         Returns:
             predicted_trajectory: 预测的轨迹 [batch_size, seq_len, joint_dim]
         """
@@ -304,155 +344,126 @@ class BidirectionalSequenceMLPPathModel(nn.Module):
             target_joint_angles = torch.zeros_like(joint_angles)
         
         # 准备起点输入并编码
-        start_inputs = self._prepare_inputs(joint_angles, joint_positions, target_position)
+        # start_inputs = self._prepare_inputs(joint_angles, joint_positions, target_position)
+        start_inputs = self._prepare_inputs(joint_angles, target_position)
+        
         start_encoded = self.start_encoder(start_inputs)
         start_encoded = self.dropout(start_encoded)
-        
         # 准备终点输入并编码
-        # 注意：这里我们使用目标关节角度和相同的目标位置
-        # 在实际应用中，可能需要计算目标关节位置
-        end_inputs = self._prepare_inputs(target_joint_angles, joint_positions, target_position)
+        # end_inputs = self._prepare_inputs(target_joint_angles, joint_positions, target_position)
+        end_inputs = self._prepare_inputs(target_joint_angles, target_position)
+        
         end_encoded = self.end_encoder(end_inputs)
         end_encoded = self.dropout(end_encoded)
-        
         # 生成双向轨迹
         predicted_trajectory = self.bidirectional_generator(start_encoded, end_encoded)
+        
+        # 应用LSTM层捕捉时序依赖
         lstm_out, _ = self.lstm(predicted_trajectory)
-        predicted_trajectory = self.lstm_projection(lstm_out)
-        return predicted_trajectory
+        lstm_out = self.layer_norm1(lstm_out)
+        
+        # 投影LSTM输出
+        trajectory = self.lstm_projection(lstm_out)
+        
+        return trajectory  # 返回预测轨迹 每个关节的角度
 
-class SequenceMLPPathModel(nn.Module):
+def trajectory_similarity_loss(pred, target, alpha=1, beta=0.5, gamma=0.5, kl_weight=0.2):
     """
-    序列编码的路径规划模型：能够处理和生成整个动作序列
+    高级轨迹损失函数：结合多种损失来减少误差累积，并添加KL散度正则化
+    
+    Args:
+        pred: 预测轨迹 [batch_size, seq_len, joint_dim]
+        target: 目标轨迹 [batch_size, seq_len, joint_dim]
+        alpha: 基础MSE损失权重
+        beta: 方向一致性损失权重
+        gamma: 累积误差损失权重
+        kl_weight: KL散度损失权重
+    
+    Returns:
+        combined_loss: 组合损失
     """
-    def __init__(self, 
-                 joint_dim=7,           # 关节角度维度
-                 position_dim=3,        # 位置维度
-                 hidden_dim=128,        # 隐藏层维度
-                 seq_len=30,            # 生成轨迹的长度
-                 dropout=0.1):          # Dropout比率
-        super(SequenceMLPPathModel, self).__init__()
-        
-        # 计算输入维度：关节角度 + 关节位置 + 目标位置
-        self.input_dim = joint_dim + joint_dim * position_dim + position_dim
-        self.joint_dim = joint_dim
-        self.position_dim = position_dim
-        self.seq_len = seq_len
-        
-        # 编码器：将状态编码为隐藏表示
-        self.encoder = MLPEncoder(self.input_dim, hidden_dim)
-        # 运动学注意力
-        self.RotationAttention = RotationMLP(hidden_dim)
-        self.TranslationAttention = TranslationMLP(hidden_dim)
-
-        self.upDim_RotationAttention = nn.Sequential(
-            nn.Linear(12, hidden_dim),
-            nn.PReLU(),
-            nn.Dropout(0.1),
-        )
-        
-        self.upDim_TranslationAttention = nn.Sequential(
-            nn.Linear(3, hidden_dim),
-            nn.PReLU(),
-            nn.Dropout(0.1),
-        )
-        # 序列生成器：一次性生成整个序列的所有时间步
-        # 输入是编码器输出
-        self.sequence_generator = MLPPathGenerator(hidden_dim, joint_dim * seq_len)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-        # 初始化参数
-        self._init_parameters()
+    batch_size, seq_len, joint_dim = pred.shape
     
-    def _init_parameters(self):
-        """初始化模型参数"""
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+    # 1. 基础MSE损失
+    mse_loss = F.mse_loss(pred, target)
     
-    def _prepare_inputs(self, joint_angles, joint_positions, target_position):
-        """准备编码器的输入"""
-        # 确保所有输入至少是二维的
-        if joint_angles.dim() == 1:
-            joint_angles = joint_angles.unsqueeze(0)
-        if joint_positions.dim() == 1:
-            joint_positions = joint_positions.unsqueeze(0)
-        if target_position.dim() == 1:
-            target_position = target_position.unsqueeze(0)
-        
-        batch_size = joint_angles.size(0)
-        
-        # 合并输入特征
-        joint_positions_flat = joint_positions.reshape(batch_size, -1)
-        inputs = torch.cat([joint_angles, joint_positions_flat, target_position], dim=1)
-        
-        return inputs
+    # 2. 方向一致性损失
+    pred_direction = pred[:, 1:] - pred[:, :-1]
+    target_direction = target[:, 1:] - target[:, :-1]
     
-    def forward(self, joint_angles, joint_positions, target_position):
-        """
-        前向传播 - 一次性生成整个轨迹序列
-        Args:
-            joint_angles: 初始关节角度 [batch_size, joint_dim]
-            joint_positions: 初始关节位置 [batch_size, joint_dim, position_dim]
-            target_position: 目标位置 [batch_size, position_dim]
-        Returns:
-            predicted_trajectory: 预测的轨迹 [batch_size, seq_len, joint_dim]
-        """
-        batch_size = joint_angles.size(0)
-        
-        # 准备输入并编码
-        inputs = self._prepare_inputs(joint_angles, joint_positions, target_position)
-        encoded_state = self.encoder(inputs)  #  [B, 256]
-        # 运动学注意力
-        # rotation_matrix = self.RotationAttention(encoded_state)
-        # rotation_matrix = self.upDim_RotationAttention(rotation_matrix)
-        # translation_vector = self.TranslationAttention(encoded_state)
-        # translation_vector = self.upDim_TranslationAttention(translation_vector)
-        # encoded_state = encoded_state*rotation_matrix*translation_vector
+    direction_sim = 1.0 - F.cosine_similarity(
+        pred_direction.reshape(-1, pred_direction.size(-1)),
+        target_direction.reshape(-1, target_direction.size(-1)),
+        dim=1
+    ).mean()
+    
+    # 3. 累积误差损失 - 对后期预测给予更高权重
+    weights = torch.linspace(1.0, 2.0, seq_len, device=pred.device)
+    weighted_errors = weights.view(1, -1, 1) * (pred - target).pow(2)
+    cumulative_loss = weighted_errors.mean()
+    
+    # 4. 关键点损失 - 特别关注序列中的关键点
+    key_indices = [0, seq_len//4, seq_len//2, 3*seq_len//4, -1]
+    key_points_loss = F.mse_loss(
+        pred[:, key_indices], 
+        target[:, key_indices]
+    )
 
-        encoded_state = self.dropout(encoded_state)
-        
-        # 生成整个轨迹序列
-        trajectory_flat = self.sequence_generator(encoded_state)
-        
-        # 重塑为 [batch_size, seq_len, joint_dim]
-        predicted_trajectory = trajectory_flat.view(batch_size, self.seq_len, self.joint_dim)
-        
-        return predicted_trajectory
+    key_indices = [0, seq_len//16, seq_len//8, 3*seq_len//16,
+    seq_len//4, 5*seq_len//16, 3*seq_len//8,
+    7*seq_len//16, 1*seq_len//2, 9*seq_len//16,
+    5*seq_len//8, 11*seq_len//16, 3*seq_len//4,
+    13*seq_len//16, 7*seq_len//8, 15*seq_len//16, -1]
+    key_points_loss = F.mse_loss(
+        pred[:, key_indices], 
+        target[:, key_indices]
+    )
 
-def trajectory_similarity_loss(pred, target):
-        """计算轨迹相似度损失，关注轨迹的整体形状而不仅是点对点距离"""
-        # 基础MSE损失
-        mse_loss = F.mse_loss(pred, target)
-        
-        # 计算轨迹方向一致性
-        pred_direction = pred[:, 1:] - pred[:, :-1]
-        target_direction = target[:, 1:] - target[:, :-1]
-        
-        # 方向余弦相似度 (值越大越相似，所以用1减去)
-        direction_sim = 1.0 - F.cosine_similarity(
-            pred_direction.reshape(-1, pred_direction.size(-1)),
-            target_direction.reshape(-1, target_direction.size(-1)),
-            dim=1
-        ).mean()
-        
-        # 轨迹形状损失：关注关键点的位置
-        # 取序列中的几个关键点(开始、1/4、中间、3/4、结束)
-        key_indices = [0, len(pred[0])//4, len(pred[0])//2, 3*len(pred[0])//4, -1]
-        key_points_loss = F.mse_loss(
-            pred[:, key_indices], 
-            target[:, key_indices]
+    
+    # 5. 速度一致性损失
+    pred_velocity = pred_direction[:, 1:] - pred_direction[:, :-1]
+    target_velocity = target_direction[:, 1:] - target_direction[:, :-1]
+    velocity_loss = F.mse_loss(pred_velocity, target_velocity)
+    # 计算加速度（二阶导数）
+    pred_accel = pred_velocity[:, 1:] - pred_velocity[:, :-1]
+    target_accel = target_velocity[:, 1:] - target_velocity[:, :-1]
+    
+    # 加速度损失（对转弯点更敏感）
+    accel_loss = F.mse_loss(pred_accel, target_accel)
+    
+    # 6. KL散度损失 - 使生成的动作轨迹分布接近专家轨迹分布
+    # 计算预测和目标轨迹的均值和方差
+    pred_mean = pred.mean(dim=1)  # [batch_size, joint_dim]
+    target_mean = target.mean(dim=1)  # [batch_size, joint_dim]
+    
+    pred_var = ((pred - pred_mean.unsqueeze(1)) ** 2).mean(dim=1)  # [batch_size, joint_dim]
+    target_var = ((target - target_mean.unsqueeze(1)) ** 2).mean(dim=1)  # [batch_size, joint_dim]
+    
+    # 确保方差为正数，避免数值问题
+    pred_var = torch.clamp(pred_var, min=1e-6)
+    target_var = torch.clamp(target_var, min=1e-6)
+    
+    # 计算KL散度: 0.5 * (log(σ2²/σ1²) + (σ1² + (μ1-μ2)²)/σ2² - 1)
+    kl_div = 0.5 * (
+        torch.log(target_var / pred_var) + 
+        (pred_var + (pred_mean - target_mean) ** 2) / target_var - 1
+    ).sum(dim=1).mean()
+    
+    # 组合损失
+    combined_loss = (
+        mse_loss + 
+        200*direction_sim + 
+        50 * cumulative_loss + 
+        200 * key_points_loss + 
+        200 * velocity_loss + 
+        200 * accel_loss
         )
-        
-        # 组合损失
-        combined_loss = mse_loss + 0.2 * direction_sim + 0.3 * key_points_loss
-        
-        return combined_loss
+    
+    return combined_loss
 
 def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64, lr=1e-4, 
                                  weight_decay=1e-5, test_ratio=0.1, save_dir='model_results', early_stop_patience=10,
-                                 save_best_only=True):
+                                 save_best_only=True, temporal_reg_weight=0.3):
     """
     训练序列MLP路径模型
     
@@ -597,16 +608,21 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
     patience_counter = 0
     for epoch in range(num_epochs):
         model.train()
+        if hasattr(model, 'set_training_mode'):
+            model.set_training_mode(True)
         epoch_loss = 0.0
         
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles, sequence_joint_angles = batch
             initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles, sequence_joint_angles = initial_joint_angles.to(device), initial_joint_positions.to(device), target_positions.to(device), target_joint_angles.to(device), sequence_joint_angles.to(device)
-            # 前向传播
-            predicted_sequence = model(initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles)
             
-            # 计算损失
-            loss = trajectory_similarity_loss(predicted_sequence, sequence_joint_angles)
+            # 前向传播
+            outputs = model(initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles)
+            
+            # 检查是否返回了时间维度轨迹
+            # 计算主要损失
+            loss = trajectory_similarity_loss(outputs, sequence_joint_angles)
+    
             # 反向传播和优化
             optimizer.zero_grad()
             loss.backward()
@@ -620,17 +636,19 @@ def train_sequence_mlp_path_model(model, dataset, num_epochs=100, batch_size=64,
         
         # 在测试集上评估
         model.eval()
+        if hasattr(model, 'set_training_mode'):
+            model.set_training_mode(False)  # 在评估时禁用时间维度正则化
         test_loss = 0.0
         
         with torch.no_grad():
             for batch in test_loader:
                 initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles, sequence_joint_angles = batch
                 initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles, sequence_joint_angles = initial_joint_angles.to(device), initial_joint_positions.to(device), target_positions.to(device), target_joint_angles.to(device), sequence_joint_angles.to(device)
-                # 前向传播
-                predicted_sequence = model(initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles)
                 
+                predicted_sequence = model(initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles)
                 # 计算损失
-                loss = criterion(predicted_sequence, sequence_joint_angles)
+                loss = trajectory_similarity_loss(predicted_sequence, sequence_joint_angles)
+            
                 test_loss += loss.item()
         
         # 计算平均测试损失
@@ -1079,6 +1097,200 @@ def compare_model_trajectories(model1, model2, env, output_file="model_compariso
     
     return traj1, traj2
 
+def train_sequence_mlp_path_model_hdf5(model, h5_file_path, num_epochs=100, batch_size=64, lr=1e-4,
+                                      weight_decay=1e-5, test_ratio=0.1, save_dir='model_results', 
+                                      early_stop_patience=10, save_best_only=True, temporal_reg_weight=0.3):
+    """
+    使用HDF5文件训练序列MLP路径模型（内存优化版本）
+    
+    Args:
+        model: SequenceMLPPathModel或BidirectionalSequenceMLPPathModel实例
+        h5_file_path: HDF5数据文件路径
+        其他参数同原函数
+    
+    Returns:
+        训练好的模型和训练/测试损失
+    """
+    import gc
+    from torch.utils.data import DataLoader, random_split
+    import matplotlib.pyplot as plt
+    
+    # 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 创建HDF5数据集
+    full_dataset = HDF5Dataset(h5_file_path, max_seq_len=model.seq_len, cache_size=batch_size*2)
+    
+    # 划分训练集和测试集
+    dataset_size = len(full_dataset)
+    test_size = int(dataset_size * test_ratio)
+    train_size = dataset_size - test_size
+    
+    train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
+    
+    # 创建数据加载器，使用较小的batch_size和多进程
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                             num_workers=2, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=2, pin_memory=True, persistent_workers=True)
+    
+    # 设置优化器和调度器
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=lr*10,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,
+        div_factor=25,
+        final_div_factor=10000
+    )
+    
+    # 训练循环
+    train_losses = []
+    test_losses = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    # 早停相关变量
+    best_test_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+    
+    for epoch in range(num_epochs):
+        model.train()
+        if hasattr(model, 'set_training_mode'):
+            model.set_training_mode(True)
+        epoch_loss = 0.0
+        
+        # 训练阶段
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            try:
+                initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles, sequence_joint_angles = batch
+                
+                # 移动到设备
+                initial_joint_angles = initial_joint_angles.to(device, non_blocking=True)
+                initial_joint_positions = initial_joint_positions.to(device, non_blocking=True)
+                target_positions = target_positions.to(device, non_blocking=True)
+                target_joint_angles = target_joint_angles.to(device, non_blocking=True)
+                sequence_joint_angles = sequence_joint_angles.to(device, non_blocking=True)
+                
+                # 前向传播
+                outputs = model(initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles)
+                
+                # 计算损失
+                loss = trajectory_similarity_loss(outputs, sequence_joint_angles)
+                
+                # 反向传播
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                
+                epoch_loss += loss.item()
+                
+                # 定期清理GPU内存
+                if batch_idx % 50 == 0:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"GPU内存不足，跳过批次 {batch_idx}")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    continue
+                else:
+                    raise e
+        
+        # 计算平均训练损失
+        avg_train_loss = epoch_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # 测试阶段
+        model.eval()
+        if hasattr(model, 'set_training_mode'):
+            model.set_training_mode(False)
+        test_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                try:
+                    initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles, sequence_joint_angles = batch
+                    
+                    initial_joint_angles = initial_joint_angles.to(device, non_blocking=True)
+                    initial_joint_positions = initial_joint_positions.to(device, non_blocking=True)
+                    target_positions = target_positions.to(device, non_blocking=True)
+                    target_joint_angles = target_joint_angles.to(device, non_blocking=True)
+                    sequence_joint_angles = sequence_joint_angles.to(device, non_blocking=True)
+                    
+                    predicted_sequence = model(initial_joint_angles, initial_joint_positions, target_positions, target_joint_angles)
+                    loss = trajectory_similarity_loss(predicted_sequence, sequence_joint_angles)
+                    test_loss += loss.item()
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print("测试时GPU内存不足，跳过批次")
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
+                    else:
+                        raise e
+        
+        # 计算平均测试损失
+        avg_test_loss = test_loss / len(test_loader)
+        test_losses.append(avg_test_loss)
+        
+        # 早停检查
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+            
+            if save_best_only:
+                best_model_path = os.path.join(save_dir, 'best_model.pth')
+                torch.save(best_model_state, best_model_path)
+                print(f"Epoch {epoch+1}: 保存最佳模型，测试损失: {best_test_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"早停触发，在第 {epoch+1} 轮停止训练")
+                break
+        
+        # 打印进度
+        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {avg_train_loss:.4f}, Test Loss: {avg_test_loss:.4f}")
+        
+        # 定期清理内存
+        if epoch % 10 == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+    # 加载最佳模型
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    # 保存最终模型和损失曲线
+    final_model_path = os.path.join(save_dir, 'final_model.pth')
+    torch.save(model.state_dict(), final_model_path)
+    
+    # 绘制损失曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='训练损失')
+    plt.plot(test_losses, label='测试损失')
+    plt.xlabel('轮次')
+    plt.ylabel('损失')
+    plt.title('训练过程损失曲线')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'final_loss_curve.png'))
+    plt.close()
+    
+    return model, train_losses, test_losses
+
 def test_model_visualization():
     """
     测试模型可视化函数 - 可视化3组运动学数据和3组MLP模型生成的数据
@@ -1386,7 +1598,12 @@ def visualize_model_predictions(model, env, dataset, num_samples=5, save_dir='mo
             joint_angles = joint_angles.to(device)
             joint_positions = joint_positions.to(device)
             target_position = target_position.to(device)
-            predicted_sequence = model(joint_angles, joint_positions, target_position, None)
+            outputs = model(joint_angles, joint_positions, target_position, None)
+            if isinstance(outputs, tuple):
+                predicted_sequence = outputs[0]
+            else:
+                predicted_sequence = outputs
+            # predicted_sequence, _ = model(joint_angles, joint_positions, target_position, None)
             predicted_sequence = predicted_sequence.squeeze(0)  # 移除批次维度
         
         # 获取真实轨迹和预测轨迹的末端执行器位置
@@ -1590,39 +1807,79 @@ def generate_trajectory_with_model(model, env, joint_angles, joint_positions, ta
         predicted_sequence = predicted_sequence.squeeze(0)  # 移除批次维度
     
     return predicted_sequence
+
+def test_hdf5_training():
+    """
+    测试HDF5训练函数
+    """
+    # 创建模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = BidirectionalSequenceMLPPathModel(
+        joint_dim=7, position_dim=3, 
+        hidden_dim=1024, seq_len=30
+    )
+    model.to(device)
+    
+    # HDF5文件路径
+    h5_file_path = 'robot_trajectory_data.h5'
+    
+    if not os.path.exists(h5_file_path):
+        print(f"HDF5文件 {h5_file_path} 不存在，请先创建数据文件")
+        return
+    
+    # 使用HDF5训练
+    trained_model, train_losses, test_losses = train_sequence_mlp_path_model_hdf5(
+        model,
+        h5_file_path,
+        num_epochs=100,
+        batch_size=256,  # 可以使用更大的batch_size
+        lr=1e-4,
+        weight_decay=1e-5,
+        test_ratio=0.2,
+        save_dir='model_results_hdf5'
+    )
+    
+    print("HDF5训练完成！")
+    return trained_model, train_losses, test_losses
+
 if __name__ == "__main__":
     # 创建序列MLP模型
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # model = SequenceMLPPathModel(joint_dim=7, position_dim=3, hidden_dim=256, seq_len=30)
-    model = BidirectionalSequenceMLPPathModel(joint_dim=7, position_dim=3, hidden_dim=512, seq_len=30)
+    model = BidirectionalSequenceMLPPathModel(
+        joint_dim=7, position_dim=3, 
+        hidden_dim=1024, seq_len=30)
+    print(model)
     model.to(device)
-    # 加载数据集
-    from robotEnv import RoboticArmEnv, collect_sequence_data2
-    env = RoboticArmEnv()
-    # dataset = collect_sequence_data2(env, num_trajectories=500000)
-    data_path = r'C:/DiskD/trae_doc/robot_gym/result/robot_trajectory_data.npy'
-    # print(f"数据收集完成，正在保存到 {data_path}...")
-    # np.save(data_path, dataset)
-    dataset = np.load(data_path, allow_pickle=True).item()
-    # 训练模型
-    import numpy as np
-    trajectories = dataset['sequence_joint_angles']
-    trajectories = np.array(trajectories)
-    print(trajectories.shape)
-    trained_model, train_losses, test_lossess = train_sequence_mlp_path_model(
+    
+    # 使用HDF5文件路径而不是加载整个数据集
+    h5_data_path = r'C:/DiskD/trae_doc/robot_gym/result/robot_trajectory_data.h5'
+    from robotEnv import collect_sequence_data3, RoboticArmEnv
+    env = RoboticArmEnv(use_gui=False)
+    dataset = collect_sequence_data3(env, 
+                                    output_file=h5_data_path,
+                                    num_trajectories=50000, 
+                                    max_steps=30)
+    # 训练模型（使用内存优化版本）
+    trained_model, train_losses, test_losses = train_sequence_mlp_path_model_hdf5(
         model, 
-        dataset, 
-        num_epochs=500, 
-        batch_size=1024, 
-        lr=8e-5, 
+        h5_data_path,
+        num_epochs=1000, 
+        batch_size=1024,  # 减小批次大小
+        lr=5e-5, 
         weight_decay=5e-4,
-        test_ratio=0.2,
+        test_ratio=0.1,
         save_dir='model_results'
     )
-    trained_model = model
-    # # 加载训练好的模型
+    # 创建环境用于测试
+    from robotEnv import RoboticArmEnv
+    env = RoboticArmEnv(use_gui=False)
+    
+    # 加载训练好的模型
     model_path = r'C:\DiskD\trae_doc\robot_gym\model_results\best_model.pth'
-    trained_model.load_state_dict(torch.load(model_path))
+    if os.path.exists(model_path):
+        trained_model.load_state_dict(torch.load(model_path))
+    else:
+        print(f"模型文件 {model_path} 不存在，使用当前训练的模型")
     obs = env.reset()
     joint_angles = obs[:env.num_joints]
     joint_positions = obs[env.num_joints:-3].reshape(env.num_joints, 3)
@@ -1635,9 +1892,21 @@ if __name__ == "__main__":
         joint_positions, 
         target_position
     )
-    # # 可视化模型预测
+    # 可视化模型预测（使用HDF5数据集的一个小样本）
     import time
-    visualize_model_predictions(model, env, dataset, num_samples=5)
+    # 从HDF5文件中读取少量数据用于可视化
+    sample_dataset = {'joint_angles': [], 'joint_positions': [], 'target_positions': [], 'sequence_joint_angles': []}
+    with h5py.File(h5_data_path, 'r') as f:
+        num_samples = min(5, len(f['joint_angles']))
+        for i in range(num_samples):
+            idx_str = str(i)
+            sample_dataset['joint_angles'].append(torch.tensor(f['joint_angles'][idx_str][:], dtype=torch.float32))
+            sample_dataset['joint_positions'].append(torch.tensor(f['joint_positions'][idx_str][:], dtype=torch.float32))
+            sample_dataset['target_positions'].append(torch.tensor(f['target_positions'][idx_str][:], dtype=torch.float32))
+            sample_dataset['sequence_joint_angles'].append(torch.tensor(f['sequence_joint_angles'][idx_str][:], dtype=torch.float32))
+    
+    visualize_model_predictions(trained_model, env, sample_dataset, num_samples=num_samples)
+    # 可视化预测的轨迹
     for i in range(predicted_sequence.size(0)):
         if torch.sum(torch.abs(predicted_sequence[i])) > 1e-6:  # 跳过填充的零
             # 设置关节角度
@@ -1647,29 +1916,7 @@ if __name__ == "__main__":
             # 可视化
             p.stepSimulation()
             time.sleep(0.05)
-    # 生成轨迹示例
-    # sample_idx = np.random.randint(0, len(dataset['initial_joint_angles']))
-    # initial_joint_angles = dataset['initial_joint_angles'][sample_idx]
-    # initial_joint_positions = dataset['initial_joint_positions'][sample_idx]
-    # target_position = dataset['target_positions'][sample_idx]
     
-    # trajectory = generate_sequence_trajectory(model, initial_joint_angles, initial_joint_positions, target_position)
-    # test_model_visualization()
-
-    # from robotEnv import RoboticArmEnv
-    # import pybullet as p
-    
-    # # # 确保连接到物理服务器
-    # if not p.isConnected():
-    #     p.connect(p.DIRECT)  # 或者使用 p.GUI 进行可视化
-    
-    # env = RoboticArmEnv()
-    
-    # try:
-    #     # 可视化collect_sequence_data2函数采集的动作轨迹
-    #     env = visualize_sequence_data2_trajectories(env, num_trajectories=5)
-    # finally:
-    #     # 确保环境在程序结束时正确关闭
-    #     env.close()
-    #     if p.isConnected():
-    #         p.disconnect()
+    # 关闭环境
+    env.close()
+    print("训练和测试完成！")
